@@ -1,0 +1,261 @@
+---
+title: "Analysis2023"
+output: html_document
+date: "2024-03-28"
+---
+
+```{r}
+library(pacman)
+
+p_load(brms, tidyverse, tidybayes, readr, 
+       viridis, bayesplot, scales, marginaleffects
+       )
+
+#select<-dplyr::select
+```
+
+
+
+```{r}
+prod_data <- read_csv(paste0(getwd(),"/Fall2024/model_data.csv")) #%>%
+  rename(Production = "mtotal(g)",
+         Site = Plot,
+         Plot = "CN-Plot",
+         Slope = "Slope prom") %>%
+  filter(!is.na(dpv)) %>% 
+  mutate(Prod_year = ifelse(Month_name %in% c("January", "February", "March", "April"), 
+                            Year - 1, Year)) %>%
+  mutate(Prod_year = factor(Prod_year),
+         Prod_month = paste(Prod_year, Month_name, sep = "_"))  
+    
+
+```
+
+dpv and pre correlations
+
+```{r}
+
+ggplot(prod_data, aes(x=scale(pre), y=scale(dpv))) + 
+  geom_smooth(method="lm") + 
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = 2) +
+  facet_grid(Prod_year~.) + 
+  theme_classic()
+
+prod_data %>% 
+  group_by(Prod_year) %>%
+  nest() %>%
+  mutate(Cor = map(data, ~unlist(cor.test(.x$pre, .x$dpv)[c(4,9, 10)]))) %>%
+  unnest(Cor) %>%
+  ungroup() %>%
+  mutate(Parameter = rep(c("correlation", "low95", "high95"), 
+                         times = length(unique(prod_data$Prod_year)))) %>%
+  pivot_wider(id_cols = c(Prod_year, data), names_from = Parameter, values_from = Cor) %>%
+  ggplot(aes(x = Prod_year, y = correlation, ymin = low95, ymax = high95)) +
+  geom_pointrange() +
+  scale_x_discrete("") +
+  theme_classic()
+
+```
+
+
+Set-up model 
+
+```{r}
+  bf_model <- "Production ~ pre + dpv + Slope + (1|Prod_month) +
+  ((dpv + pre)|Prod_year) + (1|Plot) + (Slope|Site)"
+
+prior_clim <- c(
+  prior(normal(0, 1), class = "Intercept"),
+  prior(normal(0, 1), class = "b"), 
+  prior(exponential(1), class = sigma),
+  prior(exponential(1), class = sd))
+```
+
+Sample priors
+
+```{r}
+
+  
+  bf_prior <- brm(
+    bf_model, 
+    data = prod_data,
+    family = gaussian(),
+    prior = prior_clim,
+    sample_prior = "only",
+    chains = 4, cores = 4, iter = 4000,
+    backend = "cmdstanr")
+
+  p1 <- prod_data |> 
+  add_predicted_draws(bf_prior, ndraws = 100) |> 
+  ggplot(aes(x = .prediction, group = .draw)) +
+  geom_density(width = 0.25) +
+  labs(x = "Predicted production", y = "Density") 
+
+p2 <- prod_data |> 
+  add_linpred_draws(bf_prior, ndraws = 6)# |> 
+  ggplot(aes(x = dpv, y = Production)) +
+  geom_line(aes(y = .linpred, group = paste(runner, .draw)),
+            color = clrs[1], size = 0.25) +
+  labs(x = "Age", y = "Race time") +
+  coord_cartesian(ylim = c(50, 130)) +
+  facet_wrap(vars(.draw))
+
+(p1 | p2) + plot_layout(widths = c(0.3, 0.7))  
+```
+
+Run model
+
+```{r}
+  
+  fit_clim <- brm(bf_model,
+                  family = gaussian(),
+                  data = prod_data,
+                  prior = prior_clim,
+                  init = 0,  
+                  iter = 4000,
+                  cores = 4, 
+                  control = list(adapt_delta = 0.9, max_treedepth = 15),
+                  file = "production_grams_slope",
+                  backend = "cmdstanr")
+
+```
+
+Relationships with pre and dpv
+
+```{r}
+
+# Slope for climate across years
+slopes_clim <- slopes(fit_clim, 
+                      newdata = datagrid(Prod_year = unique(prod_data$Prod_year)),
+                      variables = c("pre", "dpv"), ndraws = 1000)
+
+slopes_clim_plot <-slopes_clim %>%
+  mutate(term = ifelse(term == "dpv", "vapor pressure-deficit", "precipitation"),
+  Year = paste(as.integer(as.character(Prod_year)), as.integer(as.character(Prod_year)) + 1, sep = "-")) %>%
+  ggplot(aes(x = Year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Estimated effect\n") +
+  scale_x_discrete("") +
+  facet_grid(term~., scales = "free") + 
+  theme_classic() 
+
+ggsave("climate_slopes.png", device="png", width=11, height=8.5, units="in", dpi=600)
+
+# Slope for slope at each site
+slopes_slope <- slopes(fit_clim, 
+                       newdata = datagrid(Site= unique(prod_data$Site)),
+                       variables = "Slope", ndraws = 1000)
+
+slopes_slope_plot <-slopes_slope %>%
+  ggplot(aes(x = Site, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Estimated effect\n") +
+  scale_x_discrete("") +
+  theme_classic() 
+
+ggsave("slope_slopes.png", device="png", width=11, height=8.5, units="in", dpi=600)
+
+
+# Monthly variation in production
+time_series <- predictions(fit_clim,
+                           newdata = datagrid(Prod_year = unique(prod_data$Prod_year),
+                                              Prod_month = unique(prod_data$Prod_month)),
+                           re_formula = NULL, ndraws = 1000) %>%
+  posterior_draws()
+
+time_series_summary <- time_series %>%
+  mutate(Year = str_split_i(Prod_month, "_", 1),
+         Month = str_split_i(Prod_month, "_", 2)) %>%
+  filter(Year==Prod_year) %>%
+  group_by(Prod_month, Prod_year, Month, Year) %>%
+  median_qi(draw) %>%
+  mutate(Season = ifelse(Month %in% c("November", "December", "January", 
+                                      "February","March", "April"), "Dry", "Rainy")) %>%
+  mutate(Month = factor(Month, levels = c("May", "June", "July", "August", 
+                                          "September", "October", "November", 
+                                           "December",
+                                          "January", "February", "March", 
+                                          "April")),
+         Year = paste(as.integer(Year), as.integer(Year) + 1, sep = "-"))
+
+time_series_plot <-time_series_summary %>%
+  ggplot(aes(x = Month, y = draw, ymin = .lower, ymax = .upper, color = Season)) +
+  geom_pointrange() +
+  scale_color_viridis("", discrete = T) +
+  scale_y_continuous("Leaf litter production (g)\n") +
+  scale_x_discrete("") +
+  facet_grid(.~Year) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave("time_series.png", device="png", width=11, height=8.5, units="in", dpi=600)
+
+
+# Average climate relationship         
+predictions_climate <- bind_rows(predictions(fit_clim, 
+                                             type = "response",
+                                             newdata = datagrid(
+                                               pre = seq(min(prod_data$pre),
+                                                         max(prod_data$pre),
+                                                         length.out = 100)),
+                                               re_formula = NULL, ndraws = 1000) %>%
+                                               posterior_draws() %>%
+                                   rename(climate = pre, other_climate_1 = dpv, 
+                                          other_climate_2 = Slope) %>%
+                                   mutate(variable = "pre"),
+                                 predictions(fit_clim, 
+                                             type = "response",
+                                             newdata = datagrid(
+                                               dpv = seq(min(prod_data$dpv),
+                                                         max(prod_data$dpv),
+                                                         length.out = 100)),
+                                               re_formula = NULL, ndraws = 1000) %>%
+                                               posterior_draws() %>%
+                                   rename(climate = dpv, other_climate_1 = pre, 
+                                          other_climate_2 = Slope) %>%
+                                   mutate(variable = "dpv"),
+                                 predictions(fit_clim, 
+                                             type = "response",
+                                             newdata = datagrid(
+                                               Slope = seq(min(prod_data$Slope),
+                                                         max(prod_data$Slope),
+                                                         length.out = 100)),
+                                               re_formula = NULL, ndraws = 1000) %>%
+                                               posterior_draws() %>%
+                                   rename(climate = Slope, other_climate_1 = pre, 
+                                          other_climate_2 = dpv) %>%
+                                   mutate(variable = "Slope"))
+                                 
+
+predictions_climate_summary <- predictions_climate %>%
+  group_by(variable, climate) %>%
+  median_qi(draw)
+
+predictions_plot <-predictions_climate_summary %>%
+  mutate(variable = ifelse(variable == "pre", "precipitation", 
+                           ifelse(variable == "dpv", "vapor pressure-deficit", "slope"))) %>%
+  ggplot(aes(x = climate, y = draw, ymin = .lower, ymax = .upper)) +
+  geom_point(data = prod_data %>%
+               select(dpv, pre, Slope, Production) %>%
+               pivot_longer(cols = c(dpv, pre, Slope), names_to = "variable", 
+                            values_to = "climate") %>%
+               mutate(.lower = 0, .upper = 0) %>%
+               rename(draw = Production) %>%
+               mutate(variable = ifelse(variable == "pre", "precipitation",
+                                        ifelse(variable == "dpv", 
+                                               "vapor pressure-deficit", "slope"))), 
+             aes(y = draw, x = climate), color="grey") +
+  geom_lineribbon(alpha = 0.7) +
+  facet_grid(.~variable, scales = "free") +
+  scale_x_continuous("\n") +
+  scale_y_continuous("Leaf litter production (g)\n") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+
+ggsave("Relationships.png", device="png", width=11, height=8.5, units="in", dpi=600)
+
+
+```
