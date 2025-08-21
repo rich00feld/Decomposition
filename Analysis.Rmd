@@ -1,261 +1,534 @@
 ---
-title: "Analysis2023"
-output: html_document
-date: "2024-03-28"
+title: "Analysis2025"
+output:
+  word_document: default
+  html_document: default
+date: "2025-02-05"
 ---
 
 ```{r}
 library(pacman)
 
 p_load(brms, tidyverse, tidybayes, readr, 
-       viridis, bayesplot, scales, marginaleffects
-       )
+       viridis, bayesplot, scales, marginaleffects, cmdstanr)
 
-#select<-dplyr::select
+rhat<-brms::rhat
+register_knitr_engine(override = TRUE)
 ```
 
-
+All data for each plot
 
 ```{r}
-prod_data <- read_csv(paste0(getwd(),"/Fall2024/model_data.csv")) #%>%
-  rename(Production = "mtotal(g)",
+prod_data <- read_csv("Hojarasca_CKKEPS.csv") %>%
+  rename(Production = "total",
          Site = Plot,
-         Plot = "CN-Plot",
-         Slope = "Slope prom") %>%
-  filter(!is.na(dpv)) %>% 
-  mutate(Prod_year = ifelse(Month_name %in% c("January", "February", "March", "April"), 
-                            Year - 1, Year)) %>%
-  mutate(Prod_year = factor(Prod_year),
-         Prod_month = paste(Prod_year, Month_name, sep = "_"))  
-    
+         Plot = CNPlot,
+         precip = Rain_F,
+         temp = Temp_F,
+         vap = Vap_F,
+         vpd = VPD_F,
+         slope = sl_mean,
+         aspect = a_mean) %>%
+  mutate(Prod_year = ifelse(Month %in% c(1, 2, 3, 4), 
+                            Year - 1, Year),
+         Month_t = case_when(Month == 5 ~ 1,
+                             Month == 6 ~ 2,
+                             Month == 7 ~ 3,
+                             Month == 8 ~ 4,
+                             Month == 9 ~ 5,
+                             Month == 10 ~ 6,
+                             Month == 11 ~ 7,
+                             Month == 12 ~ 8,
+                             Month == 1 ~ 9,
+                             Month == 2 ~ 10,
+                             Month == 3 ~ 11,
+                             Month == 4 ~ 12)) %>%
+  arrange(Plot, Prod_year, Month_t) %>%
+  group_by(Plot) %>%
+  mutate(Time = row_number()) %>%
+  ungroup() %>%
+  mutate(Plot_year = paste(Plot, Prod_year, sep = "_"),
+         Prod_year = factor(Prod_year))
 
 ```
 
-dpv and pre correlations
+Lagged climate data
 
 ```{r}
 
-ggplot(prod_data, aes(x=scale(pre), y=scale(dpv))) + 
-  geom_smooth(method="lm") + 
-  geom_abline(slope = 1, intercept = 0, color = "black", linetype = 2) +
-  facet_grid(Prod_year~.) + 
-  theme_classic()
+  prod_data <- prod_data %>%
+  group_by(Site, Plot) %>%
+  mutate(lagged_precip = ifelse(Month %in% c(11, 12, 1, 2, 3, 4, 5), lag(precip), precip),
+         lagged_temp = ifelse(Month %in% c(11, 12, 1, 2, 3, 4, 5), lag(temp), temp),
+         lagged_vpd = ifelse(Month %in% c(11, 12, 1, 2, 3, 4, 5), lag(vpd), vpd)) %>%
+  ungroup()
+ 
+```
 
-prod_data %>% 
+Prior experimenting
+
+```{r}
+model_min <- brm(bf(Production ~ vpd*catAge + precip*catAge + temp*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((vpd + precip + temp)|Prod_year),
+                 autocor = ~ ar(time = Time, gr = Plot, p = 1),
+                 family = lognormal()),
+                 #family = Gamma(link = "log")),
+                 #family = gaussian()), 
+                 data = prod_data,
+                 sample_prior = "only",
+                 cores = 4,
+                 prior = c(
+                   prior(normal(log(0.45), 0.1), class = "Intercept"),
+                   prior(normal(0, 0.3), class = "b"),
+                   prior(exponential(2), class = "sigma"),
+                   prior(exponential(2), class = "sd"),
+                   prior(normal(0, 0.3), class = "sds"),
+                   prior(normal(0, 0.2), class = "ar"),
+                   #prior(gamma(2, 0.1), class = "shape")#,
+                   prior(lkj(2), class = "cor")
+                   )
+                 )
+
+pp_check(model_min, ndraws = 100)
+pp_check(model_min, ndraws = 100, type = "stat", stat = "mean")
+```
+
+
+Model specs
+
+```{r}
+
+climate_model <- bf(Production ~ vpd*catAge + precip*catAge + temp*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((vpd + precip + temp)|Prod_year),
+                 #autocor = ~ ar(time = Time, gr = Plot, p = 1),
+                 family = lognormal())
+
+lag_model <- bf(Production ~ lagged_vpd*catAge + lagged_precip*catAge + lagged_temp*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((lagged_vpd + lagged_precip + lagged_temp)|Prod_year),
+                 autocor = ~ ar(time = Time, gr = Plot, p = 1),
+                 family = lognormal())
+
+site_model <- bf(Production ~ arcilla*catAge + pH*catAge + slope*catAge + aspect*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((arcilla + pH + slope + aspect)|Prod_year),
+                 autocor = ~ ar(time = Time, gr = Plot, p = 1),
+                 family = lognormal())
+
+bf_prior <-c(prior(normal(log(0.45), 0.1), class = "Intercept"),
+             prior(normal(0, 0.3), class = "b"),
+             prior(exponential(2), class = "sigma"),
+             prior(exponential(2), class = "sd"),
+             prior(normal(0, 0.3), class = "sds"),
+             #prior(normal(0, 0.2), class = "ar"),
+             prior(lkj(2), class = "cor")
+             )
+
+```
+
+Prior check
+
+```{r}
+
+model_prior <- function(model_type, model_name){
+  brm(formula = model_type,
+      data = prod_data,
+      prior = bf_prior,
+      init = 0,
+      sample_prior = "only",
+      iter = 2000,
+      warmup = 1000,
+      chains = 4,
+      cores = 4,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      file = paste(model_name, "prior", sep = "_"),
+      backend = "cmdstanr")}
+
+model_prior(climate_model, "Climate")
+model_prior(lag_model, "Lagged")
+model_prior(site_model, "Site")
+
+all_priors <- tibble(Type = c("Climate", "Lagged", "Site")) %>%
+  mutate(Prior_sampling = map(Type, ~readRDS(paste0(.x,"_prior", ".rds")))) %>%
+  mutate(#Prior_overall = map(Prior_sampling, ~pp_check(.x, ndraws = 100, prefix = "ppd")),
+         #Prior_mean = map(Prior_sampling, ~pp_check(.x, ndraws = 100, type = "stat", stat = "mean")),
+         Prior_scatter = map(Prior_sampling, ~pp_check(.x, ndraws = 100, type = "scatter_avg")))
+  
+  
+walk2(all_priors$Type, all_priors$Prior_overall, 
+      ~ggsave(paste0("Prior_check_overall", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+walk2(all_priors$Type, all_priors$Prior_mean, 
+      ~ggsave(paste0("Prior_check_mean", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+walk2(all_priors$Type, all_priors$Prior_scatter, 
+      ~ggsave(paste0("Prior_check_scatter", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+``` 
+
+Posterior model
+
+```{r}
+
+model_posterior <- function(model_type, model_name){
+  brm(formula = model_type,
+      data = prod_data,
+      prior = bf_prior,
+      init = 0,
+      iter = 2000,
+      warmup = 1000,
+      chains = 4,
+      cores = 4,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      file = paste(model_name, "posteriorNOAR", sep = "_"),
+      backend = "cmdstanr")}
+
+model_posterior(climate_model, "Climate")
+model_posterior(lag_model, "Lagged")
+model_posterior(site_model, "Site")
+```
+
+Read in posteriors
+
+```{r}
+all_posteriors <- tibble(Type = c("Climate", 
+                                  "Lagged", 
+                                  "Site"
+                                  )) %>%
+  mutate(posterior_sampling = map(Type, ~readRDS(paste0(.x,"_posterior", ".rds")))) 
+```
+
+Posterior predictive checks
+
+```{r}
+
+posterior_checks <- all_posteriors %>%
+  mutate(posterior_overall = map(posterior_sampling, ~pp_check(.x, ndraws = 100, prefix = "ppd")),
+         posterior_mean = map(posterior_sampling, ~pp_check(.x, ndraws = 100, type = "stat", stat = "mean")),
+         posterior_max = map(posterior_sampling, ~pp_check(.x, ndraws = 100, type = "stat", stat = "max")),
+         posterior_min = map(posterior_sampling, ~pp_check(.x, ndraws = 100, type = "stat", stat = "min")))
+  
+  
+walk2(all_posteriors$Type, all_posteriors$posterior_overall, 
+      ~ggsave(paste0("posterior_check_overall", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+walk2(all_posteriors$Type, all_posteriors$posterior_mean, 
+      ~ggsave(paste0("posterior_check_mean", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+walk2(all_posteriors$Type, all_posteriors$posterior_max, 
+      ~ggsave(paste0("posterior_check_max", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+walk2(all_posteriors$Type, all_posteriors$posterior_min, 
+      ~ggsave(paste0("posterior_check_min", .x, ".png"),
+              .y,
+              "png",
+              width = 9,
+              height = 7,
+              units = "in"))
+
+```
+
+Model comparison via loo
+
+```{r}
+
+compare <- loo_compare(
+  add_criterion((all_posteriors %>%
+                   ungroup() %>%
+                   filter(Type == "Climate") %>%
+                   select(posterior_sampling) %>%
+                   pluck("posterior_sampling"))[[1]], "loo", moment_match = TRUE),
+  add_criterion((all_posteriors %>%
+                   ungroup() %>%
+                   filter(Type == "Lagged") %>%
+                   select(posterior_sampling) %>%
+                   pluck("posterior_sampling"))[[1]], "loo", moment_match = TRUE))
+
+```
+
+
+
+lag_model <- bf(Production ~ WindSpeed*catAge + vpd_p*catAge + precip_p*catAge + temp_p*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + (1|Trap) + ((WindSpeed + vpd + precip + temp)|Prod_year),
+               autocor = ~ ar(time = Time, gr = Trap, p = 1),
+               family = gaussian())
+
+site_model <- bf(Production ~ arcilla*catAge + pH*catAge + slope*catAge + aspect*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + (1|Trap) + ((arcilla + pH + slope + aspect)|Prod_year),
+               autocor = ~ ar(time = Time, gr = Trap, p = 1),
+               family = gaussian())
+               
+Climate model
+
+climate_model <- bf(Production ~ vpd*catAge + precip*catAge + temp*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((vpd + precip + temp)|Prod_year),
+                 family = lognormal())
+
+```{r}
+timeseries <- avg_predictions(posterior,
+                                 newdata = datagrid(model = posterior,
+                                                    Month_t = 1:12,
+                                                    Prod_year = unique,
+                                                    vpd = mean,
+                                                    precip = mean,
+                                                    temp = mean,
+                                                    arcilla = mean,
+                                                    pH = mean,
+                                                    slope = mean,
+                                                    aspect = mean,
+                                                    grid_type = "counterfactual") %>%
+                                select(-rowidcf, -Production) %>%
+                                distinct(),
+                              by = c("Prod_year", "Month_t"))
+
+figure_series<- timeseries %>%
+  filter(Prod_year != "2017")%>% 
+  ggplot(aes(x = Month_t, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_lineribbon(color = "black", fill = "grey") +
+  scale_y_continuous("Biomass production\n") +
+  scale_x_continuous("", breaks = 1:12, labels = c("May", "Jun", "Jul", "Aug", 
+                                                   "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr")) +
+  facet_wrap("Prod_year", nrow = 2) +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+ggsave("Full_biomass.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+
+figure_year <- timeseries %>%
+  filter(Prod_year != "2017", Month_t == 10) %>% 
+  ggplot(aes(x = Prod_year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_bar(stat="identity", color = "black", fill = "grey") +
+  geom_errorbar(width=.2) +
+  scale_y_continuous("February biomass production\n") +
+  scale_x_discrete("") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+ggsave("Annual_biomass.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+
+monthseries <- avg_predictions(posterior,
+                                 newdata = datagrid(model = posterior,
+                                                    Month_t = 1:12,
+                                                    Prod_year = unique,
+                                                    vpd = mean,
+                                                    precip = mean,
+                                                    temp = mean,
+                                                    grid_type = "counterfactual") %>%
+                                 select(-rowidcf, -Production) %>%
+                                 distinct() %>%
+                                 filter(Prod_year != "2017"),
+                              by = "Month_t")
+  
+figure_month <- monthseries %>% 
+  ggplot(aes(x = Month_t, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_lineribbon(color = "black", fill = "grey") +
+  scale_y_continuous("Biomass production\n") +
+  scale_x_continuous("", breaks = 1:12, labels = c("May", "Jun", "Jul", "Aug", 
+                                                   "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr")) +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+ggsave("Monthly_biomass.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+  
+```
+
+Calculate slopes for each cat age and year
+
+```{r}
+
+slopes_all <- avg_slopes(posterior, variables = c("vpd", "precip", "temp"),
+                         by = c("catAge", "Prod_year"))
+
+figure_slopes <- slopes_all %>% 
+  filter(Prod_year !=2017) %>%
+  ggplot(aes(x = estimate, y = Prod_year, xmin = conf.low, xmax = conf.high)) +
+  geom_pointinterval(aes(color = catAge), position = "dodge") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_y_discrete("") +
+  scale_x_continuous("\nEffect on production") +
+  scale_color_viridis("", direction = -1, discrete = TRUE) + 
+  facet_grid(. ~ term, scales = "free_x") +
+  theme_classic() +
+  theme(strip.background = element_blank())
+
+ggsave("Slopes_all.png", device="png", width = 7.5, height = 10, units = "in", dpi = 600)
+```
+
+Calculate slopes at mean values for each month or year
+
+```{r}
+slopes_rnd <- function(x){
+  
+  if(x == "Slope"|x == "Age_2021"){
+    
+    slope_per <-slopes(posterior_mix, variables = x, type = "response", 
+                       newdata = datagrid(Prod_month = unique))}else{
+                         
+    slope_per <-slopes(posterior_mix, variables = x, type = "response", 
+                       newdata = datagrid(Prod_year = unique))}}
+
+slopes_final <- tibble(Variable = c("pre", "tmp", "Slope", "Age_2021")) %>%
+  group_by(Variable) %>%
+  mutate(slopes_going = map(Variable, slopes_rnd))
+```
+
+Rate of change in biomass accumulation across spatial gradient per month
+
+```{r}
+slope_spatial <- slopes_final %>% 
+  ungroup() %>%
+  filter(Variable%in%c("Slope", "Age_2021")) %>%
+  unnest(slopes_going) %>% 
+  mutate(Month = str_split_i(Prod_month, "_", 2),
+         Year = str_split_i(Prod_month, "_", 1)) %>%
+  mutate(Month = factor(Month, levels = c("May", "June", "July", "August", "September", "October", "November", "December",
+                                          "January", "February", "March", "April"))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  #mutate(Year = as.numeric(Year)) %>%
+  ggplot(aes(x = Month, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval(aes(color = Year)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  scale_color_viridis("", direction = -1, discrete = TRUE) + 
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+#slope_spatial
+
+ggsave("Site_slopes.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+
+slope_spatial_2 <- slopes_final %>% 
+  ungroup() %>%
+  filter(Variable%in%c("Slope", "Age_2021")) %>%
+  unnest(slopes_going) %>% 
+  mutate(Month = str_split_i(Prod_month, "_", 2),
+         Year = str_split_i(Prod_month, "_", 1)) %>%
+  mutate(Month = case_when(Month == "May" ~ "May",
+                           Month == "June" ~ "Jun",
+                           Month == "July" ~ "Jul",
+                           Month == "August" ~ "Aug",
+                           Month == "September" ~ "Sep",
+                           Month == "October" ~ "Oct",
+                           Month == "November" ~ "Nov",
+                           Month == "December" ~ "Dec",
+                           Month == "January" ~ "Jan",
+                           Month == "February" ~ "Feb",
+                           Month == "March" ~ "Mar",
+                           Month == "April" ~ "Apr")) %>%
+  mutate(Month = factor(Month, levels = c("May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                                          "Jan", "Feb", "Mar", "Apr"))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  ggplot(aes(x = Year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval() +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_continuous("", breaks = seq(2013, 2022, 2)) +
+  facet_grid(Variable ~ Month, scales = "free_y") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+#slope_spatial
+
+ggsave("Site_slopes_2.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+
+
+slope_spatial_3 <- slopes_final %>% 
+  ungroup() %>%
+  filter(Variable%in%c("Slope", "Age_2021")) %>%
+  mutate(slopes_posterior = map(slopes_going, ~posterior_draws(.))) %>%
+  unnest(slopes_posterior) %>%
+  mutate(Month = str_split_i(Prod_month, "_", 2)) %>%
+  group_by(Variable, Month) %>%
+  median_qi(draw) %>%
+  mutate(Month = factor(Month, levels = c("May", "June", "July", "August", "September", "October", "November", "December",
+                                          "January", "February", "March", "April"))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  ggplot(aes(x = Month, y = draw, ymin = .lower, ymax = .upper)) +
+  geom_pointinterval() +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+#slope_spatial
+
+ggsave("Site_slopes_3.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+```
+
+
+Rate of change in biomass accumulation across monthly gradient per year
+
+```{r}
+slope_temporal <- slopes_final %>% 
+  ungroup() %>%
+  filter(Variable%in%c("tmp", "pre")) %>%
+  unnest(slopes_going) %>% 
+  mutate(Variable = ifelse(Variable == "tmp", "Temperature", "Precipitation")) %>%
+  ggplot(aes(x = Prod_year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+
+#slope_temporal
+
+ggsave("Year_slopes.png", device="png", width = 7, height = 7, units = "in", dpi = 600)
+
+pred_data <- data_mix %>%
   group_by(Prod_year) %>%
   nest() %>%
-  mutate(Cor = map(data, ~unlist(cor.test(.x$pre, .x$dpv)[c(4,9, 10)]))) %>%
-  unnest(Cor) %>%
-  ungroup() %>%
-  mutate(Parameter = rep(c("correlation", "low95", "high95"), 
-                         times = length(unique(prod_data$Prod_year)))) %>%
-  pivot_wider(id_cols = c(Prod_year, data), names_from = Parameter, values_from = Cor) %>%
-  ggplot(aes(x = Prod_year, y = correlation, ymin = low95, ymax = high95)) +
-  geom_pointrange() +
-  scale_x_discrete("") +
-  theme_classic()
-
+  mutate(Extremes = map(data, function(x){tibble(tmp = c(rep(mean(x$tmp), 10), 
+                                                         seq(min(x$tmp), max(x$tmp), length.out = 10)), 
+                                                 pre = c(seq(min(x$pre), max(x$pre), length.out = 10),
+                                                         rep(mean(x$pre), 10)))})) %>%
+  unnest(Extremes) %>%
+  mutate(Slope = mean(data_mix$Slope),
+         Age_2021 = mean(data_mix$Age_2021),
+         Prod_month = paste(Prod_year, "November", sep = "_"),
+         Site = "CN_02",
+         Plot = "CN_02_P1",
+         Trap =  "CN_02_P1_2")
+                                                 
+year_preds <- predictions(posterior_mix, newdata = pred_data, variables = c("tmp", "pre"))
 ```
 
-
-Set-up model 
-
-```{r}
-  bf_model <- "Production ~ pre + dpv + Slope + (1|Prod_month) +
-  ((dpv + pre)|Prod_year) + (1|Plot) + (Slope|Site)"
-
-prior_clim <- c(
-  prior(normal(0, 1), class = "Intercept"),
-  prior(normal(0, 1), class = "b"), 
-  prior(exponential(1), class = sigma),
-  prior(exponential(1), class = sd))
-```
-
-Sample priors
-
-```{r}
-
-  
-  bf_prior <- brm(
-    bf_model, 
-    data = prod_data,
-    family = gaussian(),
-    prior = prior_clim,
-    sample_prior = "only",
-    chains = 4, cores = 4, iter = 4000,
-    backend = "cmdstanr")
-
-  p1 <- prod_data |> 
-  add_predicted_draws(bf_prior, ndraws = 100) |> 
-  ggplot(aes(x = .prediction, group = .draw)) +
-  geom_density(width = 0.25) +
-  labs(x = "Predicted production", y = "Density") 
-
-p2 <- prod_data |> 
-  add_linpred_draws(bf_prior, ndraws = 6)# |> 
-  ggplot(aes(x = dpv, y = Production)) +
-  geom_line(aes(y = .linpred, group = paste(runner, .draw)),
-            color = clrs[1], size = 0.25) +
-  labs(x = "Age", y = "Race time") +
-  coord_cartesian(ylim = c(50, 130)) +
-  facet_wrap(vars(.draw))
-
-(p1 | p2) + plot_layout(widths = c(0.3, 0.7))  
-```
-
-Run model
-
-```{r}
-  
-  fit_clim <- brm(bf_model,
-                  family = gaussian(),
-                  data = prod_data,
-                  prior = prior_clim,
-                  init = 0,  
-                  iter = 4000,
-                  cores = 4, 
-                  control = list(adapt_delta = 0.9, max_treedepth = 15),
-                  file = "production_grams_slope",
-                  backend = "cmdstanr")
-
-```
-
-Relationships with pre and dpv
-
-```{r}
-
-# Slope for climate across years
-slopes_clim <- slopes(fit_clim, 
-                      newdata = datagrid(Prod_year = unique(prod_data$Prod_year)),
-                      variables = c("pre", "dpv"), ndraws = 1000)
-
-slopes_clim_plot <-slopes_clim %>%
-  mutate(term = ifelse(term == "dpv", "vapor pressure-deficit", "precipitation"),
-  Year = paste(as.integer(as.character(Prod_year)), as.integer(as.character(Prod_year)) + 1, sep = "-")) %>%
-  ggplot(aes(x = Year, y = estimate, ymin = conf.low, ymax = conf.high)) +
-  geom_pointrange() +
-  geom_hline(yintercept = 0, linetype = 2) +
-  scale_y_continuous("Estimated effect\n") +
-  scale_x_discrete("") +
-  facet_grid(term~., scales = "free") + 
-  theme_classic() 
-
-ggsave("climate_slopes.png", device="png", width=11, height=8.5, units="in", dpi=600)
-
-# Slope for slope at each site
-slopes_slope <- slopes(fit_clim, 
-                       newdata = datagrid(Site= unique(prod_data$Site)),
-                       variables = "Slope", ndraws = 1000)
-
-slopes_slope_plot <-slopes_slope %>%
-  ggplot(aes(x = Site, y = estimate, ymin = conf.low, ymax = conf.high)) +
-  geom_pointrange() +
-  geom_hline(yintercept = 0, linetype = 2) +
-  scale_y_continuous("Estimated effect\n") +
-  scale_x_discrete("") +
-  theme_classic() 
-
-ggsave("slope_slopes.png", device="png", width=11, height=8.5, units="in", dpi=600)
-
-
-# Monthly variation in production
-time_series <- predictions(fit_clim,
-                           newdata = datagrid(Prod_year = unique(prod_data$Prod_year),
-                                              Prod_month = unique(prod_data$Prod_month)),
-                           re_formula = NULL, ndraws = 1000) %>%
-  posterior_draws()
-
-time_series_summary <- time_series %>%
-  mutate(Year = str_split_i(Prod_month, "_", 1),
-         Month = str_split_i(Prod_month, "_", 2)) %>%
-  filter(Year==Prod_year) %>%
-  group_by(Prod_month, Prod_year, Month, Year) %>%
-  median_qi(draw) %>%
-  mutate(Season = ifelse(Month %in% c("November", "December", "January", 
-                                      "February","March", "April"), "Dry", "Rainy")) %>%
-  mutate(Month = factor(Month, levels = c("May", "June", "July", "August", 
-                                          "September", "October", "November", 
-                                           "December",
-                                          "January", "February", "March", 
-                                          "April")),
-         Year = paste(as.integer(Year), as.integer(Year) + 1, sep = "-"))
-
-time_series_plot <-time_series_summary %>%
-  ggplot(aes(x = Month, y = draw, ymin = .lower, ymax = .upper, color = Season)) +
-  geom_pointrange() +
-  scale_color_viridis("", discrete = T) +
-  scale_y_continuous("Leaf litter production (g)\n") +
-  scale_x_discrete("") +
-  facet_grid(.~Year) +
-  theme_classic() +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-ggsave("time_series.png", device="png", width=11, height=8.5, units="in", dpi=600)
-
-
-# Average climate relationship         
-predictions_climate <- bind_rows(predictions(fit_clim, 
-                                             type = "response",
-                                             newdata = datagrid(
-                                               pre = seq(min(prod_data$pre),
-                                                         max(prod_data$pre),
-                                                         length.out = 100)),
-                                               re_formula = NULL, ndraws = 1000) %>%
-                                               posterior_draws() %>%
-                                   rename(climate = pre, other_climate_1 = dpv, 
-                                          other_climate_2 = Slope) %>%
-                                   mutate(variable = "pre"),
-                                 predictions(fit_clim, 
-                                             type = "response",
-                                             newdata = datagrid(
-                                               dpv = seq(min(prod_data$dpv),
-                                                         max(prod_data$dpv),
-                                                         length.out = 100)),
-                                               re_formula = NULL, ndraws = 1000) %>%
-                                               posterior_draws() %>%
-                                   rename(climate = dpv, other_climate_1 = pre, 
-                                          other_climate_2 = Slope) %>%
-                                   mutate(variable = "dpv"),
-                                 predictions(fit_clim, 
-                                             type = "response",
-                                             newdata = datagrid(
-                                               Slope = seq(min(prod_data$Slope),
-                                                         max(prod_data$Slope),
-                                                         length.out = 100)),
-                                               re_formula = NULL, ndraws = 1000) %>%
-                                               posterior_draws() %>%
-                                   rename(climate = Slope, other_climate_1 = pre, 
-                                          other_climate_2 = dpv) %>%
-                                   mutate(variable = "Slope"))
-                                 
-
-predictions_climate_summary <- predictions_climate %>%
-  group_by(variable, climate) %>%
-  median_qi(draw)
-
-predictions_plot <-predictions_climate_summary %>%
-  mutate(variable = ifelse(variable == "pre", "precipitation", 
-                           ifelse(variable == "dpv", "vapor pressure-deficit", "slope"))) %>%
-  ggplot(aes(x = climate, y = draw, ymin = .lower, ymax = .upper)) +
-  geom_point(data = prod_data %>%
-               select(dpv, pre, Slope, Production) %>%
-               pivot_longer(cols = c(dpv, pre, Slope), names_to = "variable", 
-                            values_to = "climate") %>%
-               mutate(.lower = 0, .upper = 0) %>%
-               rename(draw = Production) %>%
-               mutate(variable = ifelse(variable == "pre", "precipitation",
-                                        ifelse(variable == "dpv", 
-                                               "vapor pressure-deficit", "slope"))), 
-             aes(y = draw, x = climate), color="grey") +
-  geom_lineribbon(alpha = 0.7) +
-  facet_grid(.~variable, scales = "free") +
-  scale_x_continuous("\n") +
-  scale_y_continuous("Leaf litter production (g)\n") +
-  theme_classic() +
-  theme(legend.position = "none")
-
-
-ggsave("Relationships.png", device="png", width=11, height=8.5, units="in", dpi=600)
-
-
-```
