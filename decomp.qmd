@@ -1,0 +1,573 @@
+---
+title: "R code for analyzing CICY decomposition data"
+author: "Richard Feldman"
+execute: 
+  echo: false
+format:
+  html:
+    toc: true
+    toc-location: left-body
+    toc-title: Contents
+    embed-resources: true
+    code-overflow: wrap
+    self-contained: true
+    grid:
+      sidebar-width: 200px
+      body-width: 1200px
+      margin-width: 0px
+      gutter-width: 1.5rem
+editor: visual
+---
+
+```{r}
+#| label: load packages
+#| message: FALSE
+#| warning: FALSE
+
+library(pacman)
+
+p_load(
+  brms, tidyverse, tidybayes, readr,
+  viridis, bayesplot, scales, marginaleffects, cmdstanr
+)
+
+rhat <- brms::rhat
+register_knitr_engine(override = TRUE)
+```
+
+All data for each plot
+
+```{r}
+#| label: load data
+#| message: FALSE
+#| warning: FALSE
+
+prod_data <- read_csv("Hojarasca_CKKEPS.csv") %>%
+  rename(
+    Site = CN,
+    ID = Plot,
+    Plot = ID_Plot
+  ) %>%
+  mutate(
+    Prod_year = ifelse(Month %in% c("Nov", "Dec"),
+      Year + 1, Year
+    ),
+    Month_t = case_when(
+      Month == "Nov" ~ 1,
+      Month == "Dec" ~ 2,
+      Month == "Jan" ~ 3,
+      Month == "Feb" ~ 4,
+      Month == "Mar" ~ 5,
+      Month == "Apr" ~ 6,
+      Month == "May" ~ 7,
+      Month == "Jun" ~ 8,
+      Month == "Jul" ~ 9,
+      Month == "Aug" ~ 10,
+      Month == "Sept" ~ 11,
+      Month == "Oct" ~ 12
+    )
+  ) %>%
+  arrange(Plot, Prod_year, Month_t) %>%
+  group_by(Plot) %>%
+  mutate(Time = row_number()) %>%
+  ungroup() %>%
+  mutate(
+    Month_year = factor(paste(Prod_year, Month_t, sep = "_")),
+    Prod_year = factor(Prod_year)
+  )
+```
+
+The model: 
+1. each month and plot specific decomposition rate depends on that month's temperature
+2. decomposition in each plot varies across sites and years
+3. the effect of temperature on decomposition varies across years
+4. decomposition varies across sites
+
+
+$$
+y_{mpys} = \beta_{0pys} + \beta_{1y} \cdot \text{temp}_{my} + \epsilon_{mpys}, \quad \epsilon_{mpys} \sim \mathcal{N}(0, \sigma^2)\\
+
+\beta_{0pys} = \gamma_{00s} + u_{0ps }+ w_{0y}, \quad u_{0ps} \sim \mathcal{N}(0, \tau_{0}^2), \quad w_{y} \sim \mathcal{N}(0, \omega_{0}^2)\\
+
+\beta_{1y} = \gamma_{10} + v_{1y}, \quad v_{1y} \sim \mathcal{N}(0, \omega_{1}^2)\\
+
+\gamma_{00s} = \delta_{000} + z_{00s}, \quad z_{00s} \sim \mathcal{N}(0, \omega_{s}^2)\\
+
+$$
+
+```{r}
+#| label: write model
+#| message: FALSE
+#| warning: FALSE
+
+priors = c(
+    prior(normal(0, 1), class = "Intercept"),
+    prior(normal(0, 1), class = "b"),
+    prior(exponential(1), class = "sigma"),
+    prior(exponential(1), class = "sd"),
+    prior(lkj(2), class = "cor")
+  )
+
+climate_prior <- function(response){
+  formula <-  bf(
+  as.formula(paste(response, "~ VPD + Rain + WindSpeed + Temp +
+    (1 | Site) + (1 | Plot) + ((VPD + Rain + WindSpeed + Temp) | Prod_year)")),
+  autocor = ~ gp(Time, by = Plot),
+  family = student
+)
+  
+    brm(
+    formula = formula,
+    data = prod_data,
+    sample_prior = "only",
+    prior = priors,
+    init = 0,
+    iter = 2000,
+    warmup = 1000,
+    chains = 4,
+    cores = 4,
+    control = list(adapt_delta = 0.99, max_treedepth = 15),
+    file = paste("Climate", response, "prior", sep = "_"),
+    backend = "cmdstanr"
+  )
+}
+
+climate_posterior <- function(response){
+  formula <-  bf(
+  as.formula(paste(response, "~ VPD + Rain + WindSpeed + Temp +
+    (1 | Site) + (1 | Plot) + ((VPD + Rain + WindSpeed + Temp) | Prod_year)")),
+  autocor = ~ gp(Time, by = Plot),
+  family = student
+)
+  
+    brm(
+    formula = formula,
+    data = prod_data,
+    prior = priors,
+    init = 0,
+    iter = 2000,
+    warmup = 1000,
+    chains = 4,
+    cores = 4,
+    control = list(adapt_delta = 0.99, max_treedepth = 15),
+    file = paste("Climate", response, "posterior", sep = "_"),
+    backend = "cmdstanr"
+  )
+}
+
+
+
+```
+
+```{r}
+#| label: prior predictive check
+#| message: FALSE
+#| warning: FALSE
+
+prior_model <- climate_prior("Total_Mgha")
+
+pp_check(prior_model, ndraws = 100)
+pp_check(prior_model, ndraws = 100, type = "stat", stat = "mean")
+```
+
+```{r}
+#| label: run posterior model
+#| message: FALSE
+#| warning: FALSE
+
+climate_total <- climate_posterior("Total_Mgha") 
+```
+
+Read in posteriors
+
+```{r}
+all_posteriors <- tibble(Type = c(
+  "Climate",
+  "Lagged",
+  "Site"
+)) %>%
+  mutate(posterior_sampling = map(Type, ~ readRDS(paste0(.x, "_posterior", ".rds"))))
+```
+
+Posterior predictive checks
+
+```{r}
+posterior_checks <- all_posteriors %>%
+  mutate(
+    posterior_overall = map(posterior_sampling, ~ pp_check(.x, ndraws = 100, prefix = "ppd")),
+    posterior_mean = map(posterior_sampling, ~ pp_check(.x, ndraws = 100, type = "stat", stat = "mean")),
+    posterior_max = map(posterior_sampling, ~ pp_check(.x, ndraws = 100, type = "stat", stat = "max")),
+    posterior_min = map(posterior_sampling, ~ pp_check(.x, ndraws = 100, type = "stat", stat = "min"))
+  )
+
+
+walk2(
+  all_posteriors$Type, all_posteriors$posterior_overall,
+  ~ ggsave(paste0("posterior_check_overall", .x, ".png"),
+    .y,
+    "png",
+    width = 9,
+    height = 7,
+    units = "in"
+  )
+)
+
+walk2(
+  all_posteriors$Type, all_posteriors$posterior_mean,
+  ~ ggsave(paste0("posterior_check_mean", .x, ".png"),
+    .y,
+    "png",
+    width = 9,
+    height = 7,
+    units = "in"
+  )
+)
+
+walk2(
+  all_posteriors$Type, all_posteriors$posterior_max,
+  ~ ggsave(paste0("posterior_check_max", .x, ".png"),
+    .y,
+    "png",
+    width = 9,
+    height = 7,
+    units = "in"
+  )
+)
+
+walk2(
+  all_posteriors$Type, all_posteriors$posterior_min,
+  ~ ggsave(paste0("posterior_check_min", .x, ".png"),
+    .y,
+    "png",
+    width = 9,
+    height = 7,
+    units = "in"
+  )
+)
+```
+
+Model comparison via loo
+
+```{r}
+compare <- loo_compare(
+  add_criterion((all_posteriors %>%
+    ungroup() %>%
+    filter(Type == "Climate") %>%
+    select(posterior_sampling) %>%
+    pluck("posterior_sampling"))[[1]], "loo", moment_match = TRUE),
+  add_criterion((all_posteriors %>%
+    ungroup() %>%
+    filter(Type == "Lagged") %>%
+    select(posterior_sampling) %>%
+    pluck("posterior_sampling"))[[1]], "loo", moment_match = TRUE)
+)
+```
+
+
+
+lag_model <- bf(Production ~ WindSpeed*catAge + vpd_p*catAge + precip_p*catAge + temp_p*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + (1|Trap) + ((WindSpeed + vpd + precip + temp)|Prod_year),
+               autocor = ~ ar(time = Time, gr = Trap, p = 1),
+               family = gaussian())
+
+site_model <- bf(Production ~ arcilla*catAge + pH*catAge + slope*catAge + aspect*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + (1|Trap) + ((arcilla + pH + slope + aspect)|Prod_year),
+               autocor = ~ ar(time = Time, gr = Trap, p = 1),
+               family = gaussian())
+               
+Climate model
+
+climate_model <- bf(Production ~ vpd*catAge + precip*catAge + temp*catAge + s(Month_t, bs = "cc") + 
+                 (1|Site) + (1|Plot) + ((vpd + precip + temp)|Prod_year),
+                 family = lognormal())
+
+```{r}
+timeseries <- avg_predictions(posterior,
+  newdata = datagrid(
+    model = posterior,
+    Month_t = 1:12,
+    Prod_year = unique,
+    vpd = mean,
+    precip = mean,
+    temp = mean,
+    arcilla = mean,
+    pH = mean,
+    slope = mean,
+    aspect = mean,
+    grid_type = "counterfactual"
+  ) %>%
+    select(-rowidcf, -Production) %>%
+    distinct(),
+  by = c("Prod_year", "Month_t")
+)
+
+figure_series <- timeseries %>%
+  filter(Prod_year != "2017") %>%
+  ggplot(aes(x = Month_t, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_lineribbon(color = "black", fill = "grey") +
+  scale_y_continuous("Biomass production\n") +
+  scale_x_continuous("", breaks = 1:12, labels = c(
+    "May", "Jun", "Jul", "Aug",
+    "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr"
+  )) +
+  facet_wrap("Prod_year", nrow = 2) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+ggsave("Full_biomass.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+
+figure_year <- timeseries %>%
+  filter(Prod_year != "2017", Month_t == 10) %>%
+  ggplot(aes(x = Prod_year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_bar(stat = "identity", color = "black", fill = "grey") +
+  geom_errorbar(width = .2) +
+  scale_y_continuous("February biomass production\n") +
+  scale_x_discrete("") +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+ggsave("Annual_biomass.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+
+monthseries <- avg_predictions(posterior,
+  newdata = datagrid(
+    model = posterior,
+    Month_t = 1:12,
+    Prod_year = unique,
+    vpd = mean,
+    precip = mean,
+    temp = mean,
+    grid_type = "counterfactual"
+  ) %>%
+    select(-rowidcf, -Production) %>%
+    distinct() %>%
+    filter(Prod_year != "2017"),
+  by = "Month_t"
+)
+
+figure_month <- monthseries %>%
+  ggplot(aes(x = Month_t, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_lineribbon(color = "black", fill = "grey") +
+  scale_y_continuous("Biomass production\n") +
+  scale_x_continuous("", breaks = 1:12, labels = c(
+    "May", "Jun", "Jul", "Aug",
+    "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr"
+  )) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+ggsave("Monthly_biomass.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+```
+
+Calculate slopes for each cat age and year
+
+```{r}
+slopes_all <- avg_slopes(posterior,
+  variables = c("vpd", "precip", "temp"),
+  by = c("catAge", "Prod_year")
+)
+
+figure_slopes <- slopes_all %>%
+  filter(Prod_year != 2017) %>%
+  ggplot(aes(x = estimate, y = Prod_year, xmin = conf.low, xmax = conf.high)) +
+  geom_pointinterval(aes(color = catAge), position = "dodge") +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_y_discrete("") +
+  scale_x_continuous("\nEffect on production") +
+  scale_color_viridis("", direction = -1, discrete = TRUE) +
+  facet_grid(. ~ term, scales = "free_x") +
+  theme_classic() +
+  theme(strip.background = element_blank())
+
+ggsave("Slopes_all.png", device = "png", width = 7.5, height = 10, units = "in", dpi = 600)
+```
+
+Calculate slopes at mean values for each month or year
+
+```{r}
+slopes_rnd <- function(x) {
+  if (x == "Slope" | x == "Age_2021") {
+    slope_per <- slopes(posterior_mix,
+      variables = x, type = "response",
+      newdata = datagrid(Prod_month = unique)
+    )
+  } else {
+    slope_per <- slopes(posterior_mix,
+      variables = x, type = "response",
+      newdata = datagrid(Prod_year = unique)
+    )
+  }
+}
+
+slopes_final <- tibble(Variable = c("pre", "tmp", "Slope", "Age_2021")) %>%
+  group_by(Variable) %>%
+  mutate(slopes_going = map(Variable, slopes_rnd))
+```
+
+Rate of change in biomass accumulation across spatial gradient per month
+
+```{r}
+slope_spatial <- slopes_final %>%
+  ungroup() %>%
+  filter(Variable %in% c("Slope", "Age_2021")) %>%
+  unnest(slopes_going) %>%
+  mutate(
+    Month = str_split_i(Prod_month, "_", 2),
+    Year = str_split_i(Prod_month, "_", 1)
+  ) %>%
+  mutate(Month = factor(Month, levels = c(
+    "May", "June", "July", "August", "September", "October", "November", "December",
+    "January", "February", "March", "April"
+  ))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  # mutate(Year = as.numeric(Year)) %>%
+  ggplot(aes(x = Month, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval(aes(color = Year)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  scale_color_viridis("", direction = -1, discrete = TRUE) +
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+# slope_spatial
+
+ggsave("Site_slopes.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+
+slope_spatial_2 <- slopes_final %>%
+  ungroup() %>%
+  filter(Variable %in% c("Slope", "Age_2021")) %>%
+  unnest(slopes_going) %>%
+  mutate(
+    Month = str_split_i(Prod_month, "_", 2),
+    Year = str_split_i(Prod_month, "_", 1)
+  ) %>%
+  mutate(Month = case_when(
+    Month == "May" ~ "May",
+    Month == "June" ~ "Jun",
+    Month == "July" ~ "Jul",
+    Month == "August" ~ "Aug",
+    Month == "September" ~ "Sep",
+    Month == "October" ~ "Oct",
+    Month == "November" ~ "Nov",
+    Month == "December" ~ "Dec",
+    Month == "January" ~ "Jan",
+    Month == "February" ~ "Feb",
+    Month == "March" ~ "Mar",
+    Month == "April" ~ "Apr"
+  )) %>%
+  mutate(Month = factor(Month, levels = c(
+    "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "Jan", "Feb", "Mar", "Apr"
+  ))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  ggplot(aes(x = Year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval() +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_continuous("", breaks = seq(2013, 2022, 2)) +
+  facet_grid(Variable ~ Month, scales = "free_y") +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+# slope_spatial
+
+ggsave("Site_slopes_2.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+
+
+slope_spatial_3 <- slopes_final %>%
+  ungroup() %>%
+  filter(Variable %in% c("Slope", "Age_2021")) %>%
+  mutate(slopes_posterior = map(slopes_going, ~ posterior_draws(.))) %>%
+  unnest(slopes_posterior) %>%
+  mutate(Month = str_split_i(Prod_month, "_", 2)) %>%
+  group_by(Variable, Month) %>%
+  median_qi(draw) %>%
+  mutate(Month = factor(Month, levels = c(
+    "May", "June", "July", "August", "September", "October", "November", "December",
+    "January", "February", "March", "April"
+  ))) %>%
+  mutate(Variable = ifelse(Variable == "Slope", "Plot slope", "Conglomerate age in 2021")) %>%
+  ggplot(aes(x = Month, y = draw, ymin = .lower, ymax = .upper)) +
+  geom_pointinterval() +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+# slope_spatial
+
+ggsave("Site_slopes_3.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+```
+
+
+Rate of change in biomass accumulation across monthly gradient per year
+
+```{r}
+slope_temporal <- slopes_final %>%
+  ungroup() %>%
+  filter(Variable %in% c("tmp", "pre")) %>%
+  unnest(slopes_going) %>%
+  mutate(Variable = ifelse(Variable == "tmp", "Temperature", "Precipitation")) %>%
+  ggplot(aes(x = Prod_year, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointinterval() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  scale_y_continuous("Magnitude and direction of effect\n") +
+  scale_x_discrete("") +
+  facet_grid(Variable ~ ., scales = "free_y") +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)
+  )
+
+# slope_temporal
+
+ggsave("Year_slopes.png", device = "png", width = 7, height = 7, units = "in", dpi = 600)
+
+pred_data <- data_mix %>%
+  group_by(Prod_year) %>%
+  nest() %>%
+  mutate(Extremes = map(data, function(x) {
+    tibble(
+      tmp = c(
+        rep(mean(x$tmp), 10),
+        seq(min(x$tmp), max(x$tmp), length.out = 10)
+      ),
+      pre = c(
+        seq(min(x$pre), max(x$pre), length.out = 10),
+        rep(mean(x$pre), 10)
+      )
+    )
+  })) %>%
+  unnest(Extremes) %>%
+  mutate(
+    Slope = mean(data_mix$Slope),
+    Age_2021 = mean(data_mix$Age_2021),
+    Prod_month = paste(Prod_year, "November", sep = "_"),
+    Site = "CN_02",
+    Plot = "CN_02_P1",
+    Trap = "CN_02_P1_2"
+  )
+
+year_preds <- predictions(posterior_mix, newdata = pred_data, variables = c("tmp", "pre"))
+```
